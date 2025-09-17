@@ -26,15 +26,18 @@ from typing import Any, Dict, Iterable, Optional, Set, Tuple, Type, Union
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
+from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               MergedColumnParallelLinear,
                                                QKVParallelLinear,
-                                               RowParallelLinear)
+                                               RowParallelLinear,
+                                               SplitQKVParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -44,6 +47,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
@@ -51,6 +55,8 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader, PPMissingLayer,
                                               is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+
+is_hpu = current_platform.is_hpu()
 
 
 class HyperCLOVAXMLP(nn.Module):
@@ -66,13 +72,31 @@ class HyperCLOVAXMLP(nn.Module):
         reduce_results: bool = True,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=hidden_size,
-            output_sizes=[intermediate_size] * 2,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-        )
+        self.bias = bias
+        if bias:
+            # Split gate and up projection to better pipeline add bias
+            self.gate_proj = ColumnParallelLinear(
+                input_size=hidden_size,
+                output_sizes=intermediate_size,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_proj",
+            )
+            self.up_proj = ColumnParallelLinear(
+                input_size=hidden_size,
+                output_size=intermediate_size,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.up_proj",
+            )
+        else:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                input_size=hidden_size,
+                output_sizes=[intermediate_size] * 2,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_up_proj",
+            )
         self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
             output_size=hidden_size,
@@ -84,11 +108,17 @@ class HyperCLOVAXMLP(nn.Module):
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
-        self.act_fn = SiluAndMul()
+        if bias:
+            self.act_fn = torch.nn.functional.silu
+        else:
+            self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        x, _ = self.gate_up_proj(x)
-        x = self.act_fn(x)
+        if self.bias:
+            x = self.act_fn(self.gate_proj(x)[0]) * self.up_proj(x)[0]
+        else:
+            x, _ = self.gate_up_proj(x)
+            x = self.act_fn(x)
         x, _ = self.down_proj(x)
         return x
 
@@ -134,16 +164,28 @@ class HyperCLOVAXAttention(nn.Module):
         self.scaling = getattr(config, "attention_multiplier", self.head_dim ** -0.5) # MuP
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.split_qkv = cache_config.split_qkv
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size=hidden_size,
-            head_size=self.head_dim,
-            total_num_heads=self.total_num_heads,
-            total_num_kv_heads=self.total_num_kv_heads,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
+        if self.split_qkv:
+            self.qkv_proj = SplitQKVParallelLinear(
+                hidden_size=hidden_size,
+                head_size=self.head_dim,
+                total_num_heads=self.total_num_heads,
+                total_num_kv_heads=self.total_num_kv_heads,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size=hidden_size,
+                head_size=self.head_dim,
+                total_num_heads=self.total_num_heads,
+                total_num_kv_heads=self.total_num_kv_heads,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
 
         self.o_proj = RowParallelLinear(
             input_size=self.total_num_heads * self.head_dim,
@@ -195,8 +237,11 @@ class HyperCLOVAXAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.split_qkv:
+            q, k, v, _ = self.qkv_proj(hidden_states)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -300,7 +345,7 @@ class HyperCLOVAXModel(nn.Module):
                  *,
                  vllm_config: VllmConfig,
                  prefix: str = "",
-                 layer_type: Type[HyperCLOVAXDecoderLayer] = HyperCLOVAXDecoderLayer):
+                 layer_type: Type[nn.Module] = HyperCLOVAXDecoderLayer):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
@@ -310,6 +355,7 @@ class HyperCLOVAXModel(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
+        self.do_mark_step = envs.VLLM_HPU_FORCE_MARK_STEP
         lora_vocab = (lora_config.lora_extra_vocab_size *
                       (lora_config.max_loras or 1)) if lora_config else 0
         self.vocab_size = config.vocab_size + lora_vocab
@@ -342,6 +388,7 @@ class HyperCLOVAXModel(nn.Module):
                 ["hidden_states", "residual"], config.hidden_size))
 
         self.embedding_multiplier = getattr(config, "embedding_multiplier", 1.0) # MuP
+        self.split_qkv = cache_config.split_qkv
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -366,6 +413,10 @@ class HyperCLOVAXModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        if is_hpu and self.do_mark_step:
+            import habana_frameworks.torch as ht
+            ht.core.mark_step()
+
         for layer in self.layers[self.start_layer:self.end_layer]:
             hidden_states = layer(positions, hidden_states)
 
@@ -380,14 +431,31 @@ class HyperCLOVAXModel(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
+        if self.split_qkv:
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                (".qkv_proj.q_proj", ".q_proj", "q"),
+                (".qkv_proj.k_proj", ".k_proj", "k"),
+                (".qkv_proj.v_proj", ".v_proj", "v"),
+            ]
+        else:
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                (".qkv_proj", ".q_proj", "q"),
+                (".qkv_proj", ".k_proj", "k"),
+                (".qkv_proj", ".v_proj", "v"),
+            ]
+
+        # If MLP bias is enabled, we run the gate and up projections separately
+        # to pipeline the bias addition.
+        mlp_bias = getattr(self.config, "mlp_bias", False)
+        if not mlp_bias:
+            stacked_params_mapping.extend([
+                # (param_name, shard_name, shard_id)
+                (".gate_up_proj", ".gate_proj", 0),
+                (".gate_up_proj", ".up_proj", 1),
+            ])
+
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
@@ -427,7 +495,10 @@ class HyperCLOVAXModel(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if self.split_qkv and (shard_id in ["q", "v", "k"]):
+                    weight_loader(param, loaded_weight)
+                else:
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
@@ -489,7 +560,7 @@ class HyperCLOVAXForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                  *,
                  vllm_config: VllmConfig,
                  prefix: str = "",
-                 layer_type: Type[HyperCLOVAXDecoderLayer] = HyperCLOVAXDecoderLayer):
+                 layer_type: Type[nn.Module] = HyperCLOVAXDecoderLayer):
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -539,7 +610,7 @@ class HyperCLOVAXForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     def _init_model(self,
                     vllm_config: VllmConfig,
                     prefix: str = "",
-                    layer_type: Type[HyperCLOVAXDecoderLayer] = HyperCLOVAXDecoderLayer):
+                    layer_type: Type[nn.Module] = HyperCLOVAXDecoderLayer):
         return HyperCLOVAXModel(vllm_config=vllm_config,
                                 prefix=prefix,
                                 layer_type=layer_type)
@@ -623,4 +694,3 @@ class HyperCLOVAXForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                 name = name.replace(item, mapping[item])
 
         return name, loaded_weight
-
